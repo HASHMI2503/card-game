@@ -1,0 +1,44 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    match /rooms/{roomId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+
+      match /players/{playerId} {
+        allow read: if isSignedIn();
+        allow write: if false;
+      }
+
+      match /gameState/{docId} {
+        allow read: if isSignedIn() && docId == 'public';
+        allow write: if false;
+      }
+
+      match /privateHands/{playerId} {
+        allow read: if isSignedIn() && request.auth.uid == playerId;
+        allow write: if false;
+      }
+
+      match /scores/{docId} {
+        allow read: if isSignedIn();
+        allow write: if false;
+      }
+
+      match /actions/{playerId} {
+        allow read: if isSignedIn() && request.auth.uid == playerId;
+
+        allow create, update: if isSignedIn()
+          && request.auth.uid == playerId
+          && request.resource.data.playerId == request.auth.uid
+          && request.resource.data.processed == false;
+
+        allow delete: if false;
+      }
+    }
+  }
+}

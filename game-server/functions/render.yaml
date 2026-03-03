@@ -1,0 +1,41 @@
+# ============================================================
+# render.yaml
+# Render.com deployment configuration
+#
+# BEGINNER STEPS TO DEPLOY:
+# 1. Push your entire project to a GitHub repository
+# 2. Go to https://render.com and sign up (free, no credit card)
+# 3. Click "New +" → "Web Service"
+# 4. Connect your GitHub repo
+# 5. Render auto-detects this file and configures everything
+# 6. Add your environment variables in the Render dashboard:
+#    FIREBASE_PROJECT_ID
+#    FIREBASE_CLIENT_EMAIL
+#    FIREBASE_PRIVATE_KEY
+# 7. Click "Deploy" — your server is live in ~2 minutes
+#
+# Your server URL will be: https://mendikot-server.onrender.com
+# Use that URL in firebase.service.js instead of Cloud Functions URL
+# ============================================================
+
+services:
+  - type: web
+    name: mendikot-server
+    env: node
+    plan: free                    # Free plan — no credit card needed
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health      # Render pings this to verify server is up
+
+    # Environment variables:
+    # Add these in Render dashboard → Environment tab
+    # Do NOT put real values here (this file goes to GitHub)
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FIREBASE_PROJECT_ID
+        sync: false               # "sync: false" means you set it manually in dashboard
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false

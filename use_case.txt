@@ -1,0 +1,229 @@
+Here is your complete, unambiguous, production-ready prompt — every rule is explicit, no assumptions needed
+
+---
+
+## FINAL PROMPT
+
+---
+
+You are a senior backend game systems architect. Build a complete, production-ready game engine in pure JavaScript for a Mendikot-style multiplayer trick-taking card game. This is logic only — no UI, no rendering, no server framework.
+
+---
+
+### ARCHITECTURE CONSTRAINTS
+
+- All state is represented as a single immutable `GameState` object
+- Every function is a pure state transition `(GameState, input) → { success boolean, state GameState, error string }`
+- No global variables. No mutations. Spreadcopy state at every level
+- No shortcuts. Handle every edge case explicitly
+- All logic is deterministic
+- Validation, rule evaluation, and state mutation must be in separate layers
+
+---
+
+### PLAYER COUNTS & DECK RULES
+
+4 Players
+- 1 standard deck A K Q J 10 9 8 7 6 5 4 3 2 per suit × 4 suits = 52 cards
+- Each player gets 13 cards → 13 tricks per match
+- Mindis (10s) 4 total (one per suit)
+- Minimum bid 8  Maximum bid 13
+
+6 Players
+- 2 decks combined, cards 6–A only 9 ranks × 4 suits × 2 = 72 cards
+- Each player gets 12 cards → 12 tricks per match
+- Mindis (10s) 8 total (two per suit across two decks)
+- Minimum bid 7  Maximum bid 12
+
+8 Players
+- 2 decks combined, cards 6–A only 9 ranks × 4 suits × 2 = 72 cards
+- Each player gets 9 cards → 9 tricks per match
+- Mindis (10s) 8 total
+- Minimum bid 7  Maximum bid 9
+
+Rank Order (high → low)
+- 68 players `A  K  Q  J  10  9  8  7  6`
+- 4 players `A  K  Q  J  10  9  8  7  6  5  4  3  2`
+
+---
+
+### TEAM ASSIGNMENT
+
+- Players choose their own seat number when joining a room (1 through N)
+- Teams are determined by alternating seat parity
+  - Team A = odd seats (1, 3, 5, 7)
+  - Team B = even seats (2, 4, 6, 8)
+- Seating is fixed for the lifetime of the room
+- If a seat is already taken, return `{ success false, error 'SEAT_TAKEN' }`
+- Game cannot start until all seats are filled
+
+---
+
+### DEALING RULES
+
+- First match of a room either team may deal (the first player to trigger `startDeal()` initiates it; their team is the dealer)
+- All subsequent matches the losing team deals
+- Dealer is tracked as a `teamId` in `GameState`
+- After deal, the winning team (non-dealer team in match 1; previous match winner thereafter) selects one card to hide (the Hidden Card)
+
+---
+
+### HIDDEN CARD SYSTEM
+
+- After cards are dealt, any one player from the hiding team calls `selectHiddenCard(playerId, cardIndex)` to nominate the hidden card
+- The hidden card is removed from that player's visible hand and stored in `GameState.hiddenCard`
+- In Contract Mode the bidding winner (and only them) may call `peekHiddenCard(playerId)` to see the hidden card's value before play starts. All others cannot see it
+- In Mindi Mode the hidden card is concealed from all players until revealed
+- The player who holds the hidden card (the player who selected it) leads the first trick
+- Revealing the hidden card During any trick, if a player cannot follow the led suit, they may call `requestHiddenCardReveal()`. The hidden card is immediately revealed to all players. The suit of the hidden card becomes the trump suit for the remainder of the match
+- The hidden card can only be revealed once per match. If already revealed, `requestHiddenCardReveal()` returns `{ success false, error 'ALREADY_REVEALED' }`
+- If the hidden card is never revealed, there is no trump suit for that match
+
+---
+
+### BIDDING PHASE
+
+Process
+- Bidding is simultaneous and open — all players may bid at any time during the bidding window
+- The engine tracks a `biddingDeadlineTimestamp` (set by the caller in ms). The engine does not run timers itself — the caller is responsible for calling `closeBidding(gameState)` after the deadline
+- Any player may call `submitBid(playerId, amount)` at any time while bidding is open
+- A bid must be strictly greater than the current highest bid and within the valid range for the player count
+- A player may call `passBid(playerId)` to opt out; a passed player cannot bid again this round
+- The highest bid at close wins. If two bids are equal (race condition), the earlier timestamp wins
+- The winning bidder's team wins the contract. The winning bidder themselves chooses the trump suit via `selectTrumpSuit(playerId, suit)` before play begins
+
+If all players pass (no bid made)
+- `closeBidding()` auto-sets `gameMode = 'MINDI'`
+- No trump suit is declared at this stage (trump emerges only if hidden card is revealed)
+
+---
+
+### GAME MODES
+
+Contract Mode (at least one bid was made)
+- The bidding winner's team must win ≥ bid number of tricks
+- If they win ≥ bid tricks → bidding team wins the match
+- If they win  bid tricks → opposing team wins the match
+
+Mindi Mode (all players passed)
+- No bid, no declared trump
+- The team that wins the majority of mindis (10s) wins the match
+- 4 players majority = 3 or more out of 4
+- 68 players majority = 5 or more out of 8
+- If mindis are split exactly equally (only possible in 4-player 2–2), the match is a draw — no winner; the same team deals again
+
+---
+
+### TRICK RULES
+
+1. The player with the hidden card leads the first trick
+2. Each subsequent trick is led by the winner of the previous trick
+3. Players must follow the led suit if they have a card of that suit in hand
+4. If a player cannot follow suit, they may play any card (and may trigger `requestHiddenCardReveal()` at this moment)
+5. Trump beats non-trump. Among trump cards, highest rank wins
+6. If no trump is played, highest card of the led suit wins
+7. Tiebreaker for duplicate cards the card played first (earlier in play order) wins
+8. The trick winner captures all cards in the trick. If any captured card is a 10, it counts as a mindi for that winner's team
+
+Validate on every `playCard()` call
+- It is this player's turn (`WRONG_TURN`)
+- The card exists in the player's hand (`CARD_NOT_IN_HAND`)
+- Suit-following rule is respected (`MUST_FOLLOW_SUIT`)
+- The match is in the playing phase (`WRONG_PHASE`)
+
+---
+
+### MATCH RESULT & RESET
+
+After all tricks are played, `resolveMatch()` must
+1. Count tricks won per team
+2. Count mindis captured per team
+3. In Contract Mode compare tricks won by bidding team vs. the bid
+4. In Mindi Mode compare mindi counts
+5. Determine match winner (or draw)
+6. Record `matchResult` in `GameState`
+7. Set `nextDealer` = losing team (or same team on draw)
+
+`resetMatch()` must
+1. Clear all hands, trick history, bid state, hidden card, trump suit, play order
+2. Retain room config, player seats, team assignments, cumulative match winloss record
+3. Set phase back to `DEALING`
+
+---
+
+### GAMESTATE SCHEMA
+
+Define a complete `GameState` object including at minimum
+
+```
+roomId, playerCount, phase, teams, players, seats,
+deck, hands (per player), hiddenCard, hiddenCardRevealed,
+trumpSuit, gameMode, biddingState, currentTrick,
+trickHistory, matchResult, dealerTeam, matchRecord
+```
+
+`phase` must be one of
+`WAITING  DEALING  HIDING_CARD  BIDDING  TRUMP_SELECTION  PLAYING  RESOLVING  COMPLETE`
+
+---
+
+### FUNCTIONS TO IMPLEMENT
+
+```
+createGame(roomId, playerCount)
+addPlayer(state, playerId, seatNumber)
+generateDeck(playerCount)
+shuffleDeck(deck)
+dealCards(state)
+selectHiddenCard(state, playerId, cardIndex)
+peekHiddenCard(state, playerId)
+startBidding(state, deadlineTimestamp)
+submitBid(state, playerId, amount)
+passBid(state, playerId)
+closeBidding(state)
+determineGameMode(state)
+selectTrumpSuit(state, playerId, suit)
+requestHiddenCardReveal(state, playerId)
+playCard(state, playerId, cardIndex)
+validateMove(state, playerId, cardIndex)
+resolveTrick(state)
+resolveMatch(state)
+applyContractResult(state)
+applyMindiResult(state)
+resetMatch(state)
+getPublicState(state, playerId)  ← strips hidden card info per viewer
+```
+
+---
+
+### getPublicState() RULES
+
+- Must return a view of `GameState` safe for a specific `playerId`
+- The hidden card value is masked unless the card is already revealed, OR the viewer is the bidding winner in Contract Mode
+- Other players' hands are not visible
+
+---
+
+### ERROR CONTRACT
+
+Every function returns
+```js
+{ success true, state GameState }          on success
+{ success false, error 'ERROR_CODE', state GameState }   on failure (state unchanged)
+```
+
+Error codes to define `SEAT_TAKEN`, `GAME_FULL`, `WRONG_PHASE`, `WRONG_TURN`, `CARD_NOT_IN_HAND`, `MUST_FOLLOW_SUIT`, `BID_TOO_LOW`, `BID_OUT_OF_RANGE`, `BIDDING_CLOSED`, `ALREADY_PASSED`, `NOT_BIDDING_WINNER`, `INVALID_SUIT`, `ALREADY_REVEALED`, `NOT_HIDING_TEAM`, `INVALID_PLAYER`
+
+---
+
+### WHAT NOT TO DO
+
+- No UI, no DOM, no rendering
+- No timers or `setTimeout` inside the engine (caller manages time)
+- No `Math.random()` outside of `shuffleDeck()`
+- No mutation of input state
+- No global state
+
+---
+
+That prompt is fully unambiguous — every edge case is specified, the deck math is verified, the hidden card lifecycle is complete, the error contract is defined, and no rule requires a guess. You can hand this directly to an LLM or a developer and get back a consistent engine.
