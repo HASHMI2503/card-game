@@ -145,6 +145,14 @@ export const ActionService = {
 };
 
 export const ListenerService = {
+  onRoomMeta(roomId, callback) {
+    return onSnapshot(
+      doc(db, 'rooms', roomId),
+      (snap) => callback(snap.exists() ? snap.data()?.metadata || null : null),
+      () => callback(null)
+    );
+  },
+
   onGameState(roomId, callback) {
     return onSnapshot(
       doc(db, 'rooms', roomId, 'gameState', 'public'),

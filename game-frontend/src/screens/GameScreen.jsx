@@ -1,8 +1,25 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { CardFace, CardBack, SuitBadge } from '../components/Card';
 import BiddingOverlay from '../components/BiddingOverlay';
 import ScoreOverlay from '../components/ScoreOverlay';
 import { ActionService, ListenerService } from '../services/firebase.service';
+
+const SUIT_ORDER = Object.freeze({ H: 0, S: 1, D: 2, C: 3 });
+const RANK_WEIGHT = Object.freeze({
+  A: 14,
+  K: 13,
+  Q: 12,
+  J: 11,
+  '10': 10,
+  '9': 9,
+  '8': 8,
+  '7': 7,
+  '6': 6,
+  '5': 5,
+  '4': 4,
+  '3': 3,
+  '2': 2,
+});
 
 function getTotalTricks(playerCount) {
   if (playerCount === 4) return 13;
@@ -12,6 +29,16 @@ function getTotalTricks(playerCount) {
 
 function scoreFromState(state) {
   return state?.score || { tricksWonByTeam: { A: 0, B: 0 }, mindisByTeam: { A: 0, B: 0 } };
+}
+
+function sortHand(cards) {
+  return [...cards].sort((a, b) => {
+    const suitGap = (SUIT_ORDER[a.suit] ?? 99) - (SUIT_ORDER[b.suit] ?? 99);
+    if (suitGap !== 0) return suitGap;
+    const rankGap = (RANK_WEIGHT[b.rank] ?? 0) - (RANK_WEIGHT[a.rank] ?? 0);
+    if (rankGap !== 0) return rankGap;
+    return String(a.id).localeCompare(String(b.id));
+  });
 }
 
 function mapError(code) {
@@ -26,75 +53,52 @@ function mapError(code) {
       return 'Action is not valid in this phase.';
     case 'NOT_BIDDING_WINNER':
       return 'Only bidding winner can do that.';
+    case 'ROOM_TIMED_OUT':
+      return 'Room timed out due to inactivity.';
+    case 'ROOM_INACTIVE':
+      return 'Room is no longer active.';
     default:
       return code || 'Action failed.';
   }
 }
 
 const TrickCard = ({ play, playerName }) => (
-  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, animation: 'cardDeal 0.3s ease both' }}>
+  <div className="trick-card">
     <CardFace rank={play.card.rank} suit={play.card.suit} size="sm" />
-    <span style={{ fontFamily: "'Cinzel',serif", fontSize: 8, letterSpacing: '0.08em', color: 'rgba(201,168,76,0.5)', textTransform: 'uppercase' }}>
-      {playerName}
-    </span>
+    <span className="trick-card-label">{playerName}</span>
   </div>
 );
 
 const OpponentHand = ({ cardCount, label, isCurrentTurn, teamId }) => {
-  const tc = teamId === 'A' ? '#c9a84c' : '#7ec8e3';
+  const turnColor = teamId === 'A' ? '#c9a84c' : '#7ec8e3';
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, opacity: cardCount === 0 ? 0.3 : 1 }}>
-      {isCurrentTurn && <div style={{ width: 8, height: 8, borderRadius: '50%', background: tc, boxShadow: `0 0 12px ${tc}` }} />}
-      <div style={{ display: 'flex', gap: -16 }}>
-        {Array.from({ length: Math.min(cardCount, 6) }).map((_, i) => (
-          <CardBack key={`${label}-${i}`} size="xs" style={{ marginLeft: i === 0 ? 0 : -18 }} />
+    <div className={`opponent-slot ${cardCount === 0 ? 'is-empty' : ''}`}>
+      {isCurrentTurn && <div className="turn-dot" style={{ background: turnColor, boxShadow: `0 0 12px ${turnColor}` }} />}
+      <div className="opponent-cards">
+        {Array.from({ length: Math.min(cardCount, 6) }).map((_, idx) => (
+          <CardBack key={`${label}-${idx}`} size="xs" style={{ marginLeft: idx === 0 ? 0 : -16 }} />
         ))}
       </div>
-      <div style={{ fontFamily: "'Cinzel',serif", fontSize: 9, letterSpacing: '0.1em', color: isCurrentTurn ? tc : 'rgba(201,168,76,0.35)', textTransform: 'uppercase' }}>
-        {label}
-      </div>
+      <div className="opponent-label" style={{ color: isCurrentTurn ? turnColor : undefined }}>{label}</div>
     </div>
   );
 };
 
 const ScoreBar = ({ score, totalTricks, trumpSuit, gameMode, bid }) => (
-  <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-      <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#c9a84c' }} />
-      <span style={{ fontFamily: "'Cinzel',serif", fontSize: 11, color: '#c9a84c' }}>A: {score?.tricksWonByTeam?.A || 0}</span>
+  <div className="score-bar">
+    <div className="score-team score-team-a">
+      <span className="team-dot" />
+      <span>A: {score?.tricksWonByTeam?.A || 0}</span>
     </div>
-
-    <span style={{ fontFamily: "'Cinzel',serif", fontSize: 9, color: 'rgba(201,168,76,0.25)' }}>vs</span>
-
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-      <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#7ec8e3' }} />
-      <span style={{ fontFamily: "'Cinzel',serif", fontSize: 11, color: '#7ec8e3' }}>B: {score?.tricksWonByTeam?.B || 0}</span>
+    <span className="score-vs">vs</span>
+    <div className="score-team score-team-b">
+      <span className="team-dot" />
+      <span>B: {score?.tricksWonByTeam?.B || 0}</span>
     </div>
-
-    <span style={{ fontFamily: "'Cinzel',serif", fontSize: 9, color: 'rgba(201,168,76,0.2)' }}>-</span>
-
-    <span style={{ fontFamily: "'Courier Prime',serif", fontSize: 10, color: 'rgba(201,168,76,0.35)' }}>
-      {(score?.tricksWonByTeam?.A || 0) + (score?.tricksWonByTeam?.B || 0)}/{totalTricks} tricks
-    </span>
-
+    <span className="score-total">{(score?.tricksWonByTeam?.A || 0) + (score?.tricksWonByTeam?.B || 0)}/{totalTricks} tricks</span>
     {trumpSuit && <SuitBadge suit={trumpSuit} label="Trump" />}
-
     {gameMode === 'CONTRACT' && bid && (
-      <div
-        style={{
-          background: 'rgba(201,168,76,0.08)',
-          border: '1px solid rgba(201,168,76,0.2)',
-          borderRadius: 6,
-          padding: '3px 8px',
-          fontFamily: "'Cinzel',serif",
-          fontSize: 9,
-          letterSpacing: '0.1em',
-          color: 'rgba(201,168,76,0.7)',
-          textTransform: 'uppercase',
-        }}
-      >
-        Bid: {bid}
-      </div>
+      <div className="score-bid">Bid: {bid}</div>
     )}
   </div>
 );
@@ -103,13 +107,24 @@ export default function GameScreen({ roomInfo, myPlayerId, onLeave }) {
   const roomId = roomInfo?.roomId;
   const [gameState, setGameState] = useState(null);
   const [players, setPlayers] = useState({});
+  const [roomMeta, setRoomMeta] = useState(null);
   const [hand, setHand] = useState([]);
-  const [selectedCard, setSelectedCard] = useState(null);
+  const [selectedCardId, setSelectedCardId] = useState(null);
   const [revealOnPlay, setRevealOnPlay] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [showScore, setShowScore] = useState(false);
+  const [throwingCardId, setThrowingCardId] = useState(null);
+  const [dragState, setDragState] = useState(null);
   const biddingCloseRequested = useRef(false);
+  const suppressClickUntilRef = useRef(0);
+  const leaveRequestedRef = useRef(false);
+
+  const sortedHand = useMemo(() => sortHand(hand), [hand]);
+  const selectedCard = useMemo(
+    () => sortedHand.find((card) => card.id === selectedCardId) || null,
+    [sortedHand, selectedCardId]
+  );
 
   useEffect(() => {
     if (!roomId || !myPlayerId) return undefined;
@@ -120,6 +135,7 @@ export default function GameScreen({ roomInfo, myPlayerId, onLeave }) {
       }),
       ListenerService.onPlayers(roomId, setPlayers),
       ListenerService.onMyHand(roomId, myPlayerId, setHand),
+      ListenerService.onRoomMeta(roomId, setRoomMeta),
     ];
 
     return () => {
@@ -130,13 +146,24 @@ export default function GameScreen({ roomInfo, myPlayerId, onLeave }) {
   }, [roomId, myPlayerId]);
 
   useEffect(() => {
-    if (selectedCard == null) return;
-    if (selectedCard >= hand.length) setSelectedCard(null);
-  }, [hand, selectedCard]);
+    if (!selectedCardId) return;
+    const stillExists = hand.some((card) => card.id === selectedCardId);
+    if (!stillExists) setSelectedCardId(null);
+  }, [hand, selectedCardId]);
 
   useEffect(() => {
     if (gameState?.phase === 'COMPLETE') setShowScore(true);
   }, [gameState?.phase]);
+
+  useEffect(() => {
+    if (roomMeta?.status !== 'TIMED_OUT' || leaveRequestedRef.current) return;
+    leaveRequestedRef.current = true;
+    setError('Room timed out due to inactivity. Returning to home...');
+    setTimeout(() => {
+      onLeave?.();
+      leaveRequestedRef.current = false;
+    }, 1200);
+  }, [roomMeta?.status, onLeave]);
 
   useEffect(() => {
     const deadline = gameState?.biddingState?.deadline;
@@ -164,8 +191,23 @@ export default function GameScreen({ roomInfo, myPlayerId, onLeave }) {
   const totalTricks = getTotalTricks(gameState?.playerCount || roomInfo?.playerCount || 4);
   const score = scoreFromState(gameState);
   const myTurn = gameState?.phase === 'PLAYING' && gameState?.turn === myPlayerId;
-  const canHideCard = gameState?.phase === 'HIDING_CARD' && players[myPlayerId]?.teamId === gameState?.hidingTeam;
   const canPickTrump = gameState?.phase === 'TRUMP_SELECTION' && gameState?.biddingState?.biddingWinner === myPlayerId;
+  const ledSuit = gameState?.currentTrick?.ledSuit || null;
+  const hasLedSuitInHand = ledSuit ? hand.some((card) => card.suit === ledSuit) : false;
+  const canRequestReveal = Boolean(
+    myTurn &&
+    gameState?.phase === 'PLAYING' &&
+    !gameState?.hiddenCardRevealed &&
+    gameState?.hiddenCardHolder &&
+    selectedCard &&
+    ledSuit &&
+    selectedCard.suit !== ledSuit &&
+    !hasLedSuitInHand
+  );
+
+  useEffect(() => {
+    if (!canRequestReveal) setRevealOnPlay(false);
+  }, [canRequestReveal]);
 
   const opponents = Object.entries(players)
     .filter(([pid]) => pid !== myPlayerId)
@@ -177,29 +219,41 @@ export default function GameScreen({ roomInfo, myPlayerId, onLeave }) {
     setError('');
     try {
       const resp = await fn();
-      if (resp?.success === false) setError(mapError(resp.error));
+      if (resp?.success === false) {
+        const message = mapError(resp.error);
+        setError(message);
+        if ((resp.error === 'ROOM_INACTIVE' || resp.error === 'ROOM_TIMED_OUT') && !leaveRequestedRef.current) {
+          leaveRequestedRef.current = true;
+          setTimeout(() => {
+            onLeave?.();
+            leaveRequestedRef.current = false;
+          }, 1200);
+        }
+      }
+      return resp;
     } catch (err) {
       setError(err?.message || 'Action failed.');
+      return { success: false };
     } finally {
       setBusy(false);
     }
   };
 
-  const handleHideCard = () => {
-    if (selectedCard == null) return;
-    const card = hand[selectedCard];
+  const playCardById = async (cardId, reveal = false) => {
+    if (!cardId || busy || !myTurn || gameState?.phase !== 'PLAYING') return;
+    const card = hand.find((c) => c.id === cardId);
     if (!card) return;
-    doAction(() => ActionService.selectHiddenCard(roomId, myPlayerId, card.id));
-    setSelectedCard(null);
+    setThrowingCardId(cardId);
+    setSelectedCardId(null);
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    await doAction(() => ActionService.playCard(roomId, myPlayerId, card.id, reveal));
+    setThrowingCardId(null);
+    setRevealOnPlay(false);
   };
 
   const handlePlayCard = () => {
-    if (selectedCard == null) return;
-    const card = hand[selectedCard];
-    if (!card) return;
-    doAction(() => ActionService.playCard(roomId, myPlayerId, card.id, revealOnPlay));
-    setRevealOnPlay(false);
-    setSelectedCard(null);
+    if (!selectedCard) return;
+    playCardById(selectedCard.id, revealOnPlay);
   };
 
   const handleBid = (amount) => doAction(() => ActionService.submitBid(roomId, myPlayerId, amount));
@@ -210,99 +264,212 @@ export default function GameScreen({ roomInfo, myPlayerId, onLeave }) {
     doAction(() => ActionService.resetMatch(roomId));
   };
 
+  const handleCardClick = (cardId) => {
+    if (Date.now() < suppressClickUntilRef.current) return;
+    setSelectedCardId((prev) => (prev === cardId ? null : cardId));
+  };
+
+  const handleCardPointerDown = (cardId, event) => {
+    if (!myTurn || gameState?.phase !== 'PLAYING') return;
+    if (cardId !== selectedCardId) return;
+    setDragState({
+      cardId,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      dx: 0,
+      dy: 0,
+    });
+  };
+
+  const handleCardPointerMove = (cardId, event) => {
+    if (!dragState) return;
+    if (dragState.cardId !== cardId || dragState.pointerId !== event.pointerId) return;
+    setDragState((prev) =>
+      prev
+        ? {
+            ...prev,
+            dx: event.clientX - prev.startX,
+            dy: event.clientY - prev.startY,
+          }
+        : prev
+    );
+  };
+
+  const handleCardPointerEnd = (cardId, event) => {
+    if (!dragState) return;
+    if (dragState.cardId !== cardId || dragState.pointerId !== event.pointerId) return;
+    const { dx, dy } = dragState;
+    const dragDistance = Math.hypot(dx, dy);
+    const shouldThrow = dy < -85 || (dragDistance > 150 && dy < -20);
+    setDragState(null);
+    if (!shouldThrow) return;
+    suppressClickUntilRef.current = Date.now() + 220;
+    playCardById(cardId, revealOnPlay);
+  };
+
   return (
-    <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', background: 'radial-gradient(ellipse at 50% 40%, #091a0c, #050e07)', position: 'relative', overflow: 'hidden' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 20px', borderBottom: '1px solid rgba(201,168,76,0.07)', background: 'rgba(5,14,7,0.8)', backdropFilter: 'blur(8px)', flexShrink: 0, zIndex: 10, animation: 'fadeDown 0.4s ease both' }}>
-        <button onClick={onLeave} style={{ background: 'none', border: 'none', cursor: 'pointer', fontFamily: "'Cinzel',serif", fontSize: 10, letterSpacing: '0.1em', color: 'rgba(201,168,76,0.3)', textTransform: 'uppercase' }}>
-          Leave
-        </button>
-
-        <ScoreBar score={score} totalTricks={totalTricks} trumpSuit={gameState?.trumpSuit} gameMode={gameState?.gameMode} bid={gameState?.biddingState?.highestBid?.amount} />
-
-        <button onClick={() => setShowScore(true)} className="btn-ghost" style={{ padding: '5px 10px', fontSize: 10 }}>
-          Scores
-        </button>
+    <div className="game-screen">
+      <div className="game-topbar">
+        <button onClick={onLeave} className="topbar-link">Leave</button>
+        <ScoreBar
+          score={score}
+          totalTricks={totalTricks}
+          trumpSuit={gameState?.trumpSuit}
+          gameMode={gameState?.gameMode}
+          bid={gameState?.biddingState?.highestBid?.amount}
+        />
+        <button onClick={() => setShowScore(true)} className="btn-ghost topbar-score-btn">Scores</button>
       </div>
 
-      {error && <div style={{ margin: '8px auto 0', padding: '6px 10px', color: '#f4b1a9', border: '1px solid rgba(192,57,43,0.3)', borderRadius: 8, background: 'rgba(192,57,43,0.12)', fontSize: 13 }}>{error}</div>}
+      {error && <div className="game-error-banner">{error}</div>}
 
-      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
-        <div style={{ position: 'absolute', top: '8%', left: '12%', right: '12%', bottom: '28%', borderRadius: '50%', background: 'radial-gradient(ellipse at 40% 38%, #115c22, #0a3a14 50%, #072a0f)', border: '3px solid #5a3a18', boxShadow: 'inset 0 4px 60px rgba(0,0,0,0.5), 0 0 60px rgba(0,0,0,0.4)' }} />
+      <div className="game-table-wrap">
+        <div className="game-felt" />
 
-        <div style={{ position: 'absolute', top: '3%', left: '50%', transform: 'translateX(-50%)', display: 'flex', gap: 16, flexWrap: 'wrap', justifyContent: 'center' }}>
+        <div className="opponents-row">
           {opponents.map((op) => (
-            <OpponentHand key={op.pid} cardCount={Array.isArray(gameState?.hands?.[op.pid]) ? gameState.hands[op.pid].length : hand.length} label={op.displayName || op.pid} isCurrentTurn={gameState?.turn === op.pid} teamId={op.teamId} />
+            <OpponentHand
+              key={op.pid}
+              cardCount={Array.isArray(gameState?.hands?.[op.pid]) ? gameState.hands[op.pid].length : hand.length}
+              label={op.displayName || op.pid}
+              isCurrentTurn={gameState?.turn === op.pid}
+              teamId={op.teamId}
+            />
           ))}
         </div>
 
-        <div style={{ position: 'absolute', top: '52%', left: '50%', transform: 'translate(-50%,-58%)', display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'center', flexWrap: 'wrap' }}>
+        <div className="trick-zone">
           {(gameState?.currentTrick?.plays || []).map((play) => (
-            <TrickCard key={`${play.playerId}-${play.order}`} play={play} playerName={play.playerId === myPlayerId ? 'You' : players[play.playerId]?.displayName || play.playerId} />
+            <TrickCard
+              key={`${play.playerId}-${play.order}`}
+              play={play}
+              playerName={play.playerId === myPlayerId ? 'You' : players[play.playerId]?.displayName || play.playerId}
+            />
           ))}
-          {(gameState?.currentTrick?.plays || []).length === 0 && <div style={{ fontFamily: "'EB Garamond',serif", fontSize: 13, fontStyle: 'italic', color: 'rgba(201,168,76,0.2)' }}>{myTurn ? 'Your lead' : 'Waiting for lead'}</div>}
+          {(gameState?.currentTrick?.plays || []).length === 0 && (
+            <div className="trick-placeholder">{myTurn ? 'Your lead' : 'Waiting for lead'}</div>
+          )}
         </div>
 
         {canPickTrump && (
-          <div style={{ position: 'absolute', top: '35%', left: '50%', transform: 'translateX(-50%)', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
-            <div style={{ color: 'var(--gold)', letterSpacing: '0.08em', fontFamily: "'Cinzel',serif" }}>Select Trump Suit</div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              {['S', 'H', 'D', 'C'].map((s) => (
-                <button key={s} className="btn-ghost" onClick={() => handleSelectTrump(s)} style={{ minWidth: 64, padding: '10px 14px' }}>
-                  {s}
+          <div className="trump-picker">
+            <div className="trump-picker-title">Select Trump Suit</div>
+            <div className="trump-picker-actions">
+              {['S', 'H', 'D', 'C'].map((suit) => (
+                <button
+                  key={suit}
+                  className="btn-ghost trump-suit-btn"
+                  onClick={() => handleSelectTrump(suit)}
+                >
+                  {suit}
                 </button>
               ))}
             </div>
           </div>
         )}
 
-        {gameState?.phase === 'HIDING_CARD' && (
-          <div style={{ position: 'absolute', bottom: '33%', left: '50%', transform: 'translateX(-50%)', color: 'rgba(201,168,76,0.8)', fontFamily: "'Cinzel',serif", fontSize: 12, letterSpacing: '0.08em' }}>
-            {canHideCard ? 'Select one card to hide' : 'Waiting for hiding team...'}
-          </div>
-        )}
-
         {myTurn && gameState?.phase === 'PLAYING' && (
-          <div style={{ position: 'absolute', bottom: '33%', left: '50%', transform: 'translateX(-50%)', display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(201,168,76,0.1)', border: '1px solid rgba(201,168,76,0.3)', borderRadius: 20, padding: '4px 14px' }}>
-            <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--gold)' }} />
-            <span style={{ fontFamily: "'Cinzel',serif", fontSize: 9, letterSpacing: '0.15em', color: 'var(--gold)', textTransform: 'uppercase' }}>Your Turn</span>
+          <div className="turn-chip">
+            <span className="turn-chip-dot" />
+            <span>Your Turn</span>
           </div>
         )}
       </div>
 
-      <div style={{ flexShrink: 0, background: 'linear-gradient(to top, rgba(3,7,4,0.95), rgba(5,14,7,0.8) 60%, transparent)', paddingTop: 12, minHeight: 170, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, animation: 'fadeUp 0.5s 0.2s ease both' }}>
-        <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'center', gap: hand.length > 10 ? -4 : hand.length > 7 ? 2 : 6, paddingBottom: 12, paddingTop: 4, overflowX: 'auto', maxWidth: '100vw', paddingLeft: 20, paddingRight: 20 }}>
-          {hand.map((card, idx) => (
-            <CardFace key={card.id} rank={card.rank} suit={card.suit} size="md" playable={canHideCard || myTurn} selected={selectedCard === idx} onClick={() => setSelectedCard((prev) => (prev === idx ? null : idx))} dealDelay={idx * 0.03} style={{ marginLeft: idx === 0 ? 0 : hand.length > 10 ? -18 : hand.length > 7 ? -10 : 0 }} />
-          ))}
-          {hand.length === 0 && <div style={{ color: 'rgba(201,168,76,0.35)', padding: '16px 0' }}>No cards</div>}
+      <div className="hand-dock">
+        <div className="hand-row">
+          {sortedHand.map((card, idx) => {
+            const isDragging = dragState?.cardId === card.id;
+            const isThrowing = throwingCardId === card.id;
+            const dragStyle = isDragging
+              ? {
+                  transform: `translate(${dragState.dx}px, ${dragState.dy}px) scale(1.08)`,
+                  transition: 'none',
+                  zIndex: 60,
+                }
+              : null;
+            const throwStyle = isThrowing
+              ? { animation: 'cardThrow 0.2s ease forwards', pointerEvents: 'none' }
+              : null;
+
+            return (
+              <CardFace
+                key={card.id}
+                rank={card.rank}
+                suit={card.suit}
+                size="md"
+                playable={myTurn && gameState?.phase === 'PLAYING'}
+                selected={selectedCardId === card.id}
+                onClick={() => handleCardClick(card.id)}
+                onPointerDown={(event) => handleCardPointerDown(card.id, event)}
+                onPointerMove={(event) => handleCardPointerMove(card.id, event)}
+                onPointerUp={(event) => handleCardPointerEnd(card.id, event)}
+                onPointerCancel={(event) => handleCardPointerEnd(card.id, event)}
+                dealDelay={idx * 0.03}
+                style={{
+                  marginLeft: idx === 0 ? 0 : sortedHand.length > 10 ? -18 : sortedHand.length > 7 ? -10 : 0,
+                  ...(dragStyle || {}),
+                  ...(throwStyle || {}),
+                }}
+              />
+            );
+          })}
+          {sortedHand.length === 0 && <div className="hand-empty">No cards</div>}
         </div>
 
-        {myTurn && gameState?.phase === 'PLAYING' && selectedCard != null && (
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'rgba(201,168,76,0.65)', fontSize: 12 }}>
-            <input type="checkbox" checked={revealOnPlay} onChange={(e) => setRevealOnPlay(e.target.checked)} />
-            Request hidden-card reveal if legal
-          </label>
-        )}
+        <div className="table-actions">
+          {canRequestReveal && (
+            <button
+              type="button"
+              className={`reveal-chip ${revealOnPlay ? 'is-active' : ''}`}
+              onClick={() => setRevealOnPlay((prev) => !prev)}
+            >
+              {revealOnPlay ? 'Reveal: ON' : 'Ask Reveal'}
+            </button>
+          )}
 
-        {canHideCard && selectedCard != null && (
-          <button className="btn-primary" onClick={handleHideCard} disabled={busy} style={{ marginBottom: 10, padding: '11px 30px' }}>
-            {busy ? 'Working...' : 'Hide Selected Card'}
-          </button>
-        )}
-
-        {myTurn && gameState?.phase === 'PLAYING' && selectedCard != null && (
-          <button className="btn-primary" onClick={handlePlayCard} disabled={busy} style={{ marginBottom: 10, padding: '11px 36px' }}>
-            {busy ? 'Working...' : 'Play Selected Card'}
-          </button>
-        )}
+          {myTurn && gameState?.phase === 'PLAYING' && selectedCard && (
+            <button
+              className="btn-primary play-btn"
+              onClick={handlePlayCard}
+              disabled={busy}
+            >
+              {busy ? 'Working...' : 'Play Selected Card'}
+            </button>
+          )}
+        </div>
       </div>
 
       {gameState?.phase === 'BIDDING' && gameState?.biddingState?.isOpen && (
-        <BiddingOverlay playerCount={gameState?.playerCount || 4} myPlayerId={myPlayerId} players={players} biddingState={gameState?.biddingState || { isOpen: true, bids: {}, passedPlayers: [], highestBid: null }} deadline={gameState?.biddingState?.deadline} onBid={handleBid} onPass={handlePass} disabled={busy} />
+        <BiddingOverlay
+          playerCount={gameState?.playerCount || 4}
+          myPlayerId={myPlayerId}
+          players={players}
+          biddingState={
+            gameState?.biddingState || {
+              isOpen: true,
+              bids: {},
+              passedPlayers: [],
+              highestBid: null,
+            }
+          }
+          deadline={gameState?.biddingState?.deadline}
+          onBid={handleBid}
+          onPass={handlePass}
+          disabled={busy}
+        />
       )}
 
       {showScore && (
-        <ScoreOverlay matchResult={gameState?.matchResult} matchRecord={gameState?.matchRecord} players={players} teams={gameState?.teams || { A: { playerIds: [] }, B: { playerIds: [] } }} onNextMatch={handleResetMatch} onHome={onLeave} />
+        <ScoreOverlay
+          matchResult={gameState?.matchResult}
+          matchRecord={gameState?.matchRecord}
+          players={players}
+          teams={gameState?.teams || { A: { playerIds: [] }, B: { playerIds: [] } }}
+          onNextMatch={handleResetMatch}
+          onHome={onLeave}
+        />
       )}
     </div>
   );

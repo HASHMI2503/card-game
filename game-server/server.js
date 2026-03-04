@@ -39,6 +39,9 @@ admin.initializeApp({
 
 const db   = admin.firestore();
 const auth = admin.auth();
+const ACTIVE_ROOM_STATUS = Object.freeze(['WAITING', 'IN_PROGRESS']);
+const GAME_IDLE_TIMEOUT_MS = 10 * 60_000;
+const ROOM_MAINTENANCE_INTERVAL_MS = 60_000;
 
 // ── Game engine (pure logic, no Firebase dependency) ─────────────────────────
 const GameEngine = require('./frontend/src/index');
@@ -102,6 +105,7 @@ app.post('/createRoom', requireAuth, async (req, res) => {
         playerCount,
         status:    'WAITING',
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastActivityAt: admin.firestore.FieldValue.serverTimestamp(),
         createdBy: playerId,
       }
     });
@@ -177,10 +181,15 @@ app.post('/joinRoom', requireAuth, async (req, res) => {
     // Check if already in room (reconnect)
     const existingSnap = await roomRef.collection('players').doc(playerId).get();
     if (existingSnap.exists) {
-      await roomRef.collection('players').doc(playerId).update({
-        status:     'connected',
-        lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      await Promise.all([
+        roomRef.collection('players').doc(playerId).update({
+          status:     'connected',
+          lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+        }),
+        roomRef.update({
+          'metadata.lastActivityAt': admin.firestore.FieldValue.serverTimestamp(),
+        }),
+      ]);
       watchRoom(roomId);
       return res.json({ success: true, roomId, reconnected: true });
     }
@@ -200,6 +209,9 @@ app.post('/joinRoom', requireAuth, async (req, res) => {
       isReady:     false,
       joinedAt:    admin.firestore.FieldValue.serverTimestamp(),
       lastSeenAt:  admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await roomRef.update({
+      'metadata.lastActivityAt': admin.firestore.FieldValue.serverTimestamp(),
     });
 
     // Make sure we are watching this room
@@ -250,12 +262,28 @@ app.post('/playerReconnected', requireAuth, async (req, res) => {
   try {
     const { roomId } = req.body;
     const playerId   = req.uid;
+    const roomRef = db.collection('rooms').doc(roomId);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) {
+      return res.json({ success: false, error: 'ROOM_NOT_FOUND' });
+    }
+    const roomStatus = roomSnap.data()?.metadata?.status;
+    if (!isRoomStatusActive(roomStatus)) {
+      return res.json({
+        success: false,
+        error: roomStatus === 'TIMED_OUT' ? 'ROOM_TIMED_OUT' : 'ROOM_INACTIVE',
+      });
+    }
 
-    await db.collection('rooms').doc(roomId)
-      .collection('players').doc(playerId).update({
+    await Promise.all([
+      roomRef.collection('players').doc(playerId).update({
         status:     'connected',
         lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      }),
+      roomRef.update({
+        'metadata.lastActivityAt': admin.firestore.FieldValue.serverTimestamp(),
+      }),
+    ]);
 
     watchRoom(roomId);
     return res.json({ success: true });
@@ -278,7 +306,22 @@ app.post('/playerReconnected', requireAuth, async (req, res) => {
 // ============================================================
 
 // Track which rooms we are already watching (avoid duplicate listeners)
-const watchedRooms = new Set();
+const roomWatchers = new Map();
+
+function isRoomStatusActive(status) {
+  return ACTIVE_ROOM_STATUS.includes(status);
+}
+
+function detachRoomWatcher(roomId) {
+  const unsub = roomWatchers.get(roomId);
+  if (!unsub) return;
+  try {
+    unsub();
+  } catch (err) {
+    console.error(`[watchRoom] Failed to detach watcher for ${roomId}:`, err);
+  }
+  roomWatchers.delete(roomId);
+}
 
 /**
  * Start watching a room's actions subcollection.
@@ -287,15 +330,14 @@ const watchedRooms = new Set();
  * @param {string} roomId
  */
 function watchRoom(roomId) {
-  if (watchedRooms.has(roomId)) return;
-  watchedRooms.add(roomId);
+  if (roomWatchers.has(roomId)) return;
 
   console.log(`[watchRoom] Now watching room: ${roomId}`);
 
   const actionsRef = db.collection('rooms').doc(roomId).collection('actions');
 
   // Listen for NEW unprocessed action documents
-  actionsRef
+  const unsubscribe = actionsRef
     .where('processed', '==', false)
     .onSnapshot(async (snapshot) => {
       // Process each new/changed action document
@@ -321,6 +363,9 @@ function watchRoom(roomId) {
             result,
             processedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
+          if (result?.phase === 'COMPLETE') {
+            detachRoomWatcher(roomId);
+          }
 
         } catch (err) {
           console.error(`[watchRoom] Error processing action in ${roomId}:`, err);
@@ -333,9 +378,11 @@ function watchRoom(roomId) {
       }
     }, (err) => {
       console.error(`[watchRoom] Listener error for room ${roomId}:`, err);
-      // Remove from set so it can be re-watched
-      watchedRooms.delete(roomId);
+      // Remove so it can be re-watched
+      roomWatchers.delete(roomId);
     });
+
+  roomWatchers.set(roomId, unsubscribe);
 }
 
 
@@ -359,12 +406,21 @@ async function processGameAction(roomId, playerId, actionData) {
   const roomRef = db.collection('rooms').doc(roomId);
 
   // ── Load current engine state ──────────────────────────────────────────────
-  const [engineSnap, playerSnap, playersSnap] = await Promise.all([
+  const [roomSnap, engineSnap, playerSnap, playersSnap] = await Promise.all([
+    roomRef.get(),
     roomRef.collection('gameState').doc('engine').get(),
     roomRef.collection('players').doc(playerId).get(),
     roomRef.collection('players').get(),
   ]);
 
+  if (!roomSnap.exists) return { success: false, error: 'ROOM_NOT_FOUND' };
+  const roomStatus = roomSnap.data()?.metadata?.status;
+  if (!isRoomStatusActive(roomStatus)) {
+    return {
+      success: false,
+      error: roomStatus === 'TIMED_OUT' ? 'ROOM_TIMED_OUT' : 'ROOM_INACTIVE',
+    };
+  }
   if (!engineSnap.exists) return { success: false, error: 'ROOM_NOT_FOUND' };
   if (!playerSnap.exists) return { success: false, error: 'INVALID_PLAYER' };
 
@@ -435,7 +491,7 @@ async function handleCloseBidding({ state, playerId, db, roomRef }) {
   const result = GameEngine.closeBidding(state, Date.now());
   if (!result.success) return { success: false, error: result.error };
   await saveState(roomRef, result.state, playerId);
-  return { success: true };
+  return { success: true, phase: result.state.phase };
 }
 
 async function handleResetMatch({ state, playerId, db, roomRef }) {
@@ -445,7 +501,7 @@ async function handleResetMatch({ state, playerId, db, roomRef }) {
   const dealt = GameEngine.startDeal(result.state, playerId);
   if (!dealt.success) return { success: false, error: dealt.error };
   await saveState(roomRef, dealt.state, playerId);
-  return { success: true };
+  return { success: true, phase: dealt.state.phase };
 }
 
 
@@ -496,6 +552,15 @@ async function saveState(roomRef, newState, viewerPlayerId) {
       updatedAt:    admin.firestore.FieldValue.serverTimestamp(),
     });
   }
+
+  const roomMetadataUpdate = {
+    'metadata.lastActivityAt': admin.firestore.FieldValue.serverTimestamp(),
+  };
+  if (newState.phase === 'COMPLETE') {
+    roomMetadataUpdate['metadata.status'] = 'COMPLETE';
+    roomMetadataUpdate['metadata.completedAt'] = admin.firestore.FieldValue.serverTimestamp();
+  }
+  batch.update(roomRef, roomMetadataUpdate);
 
   await batch.commit();
 }
@@ -572,14 +637,31 @@ app.post('/heartbeat', requireAuth, async (req, res) => {
   const playerId   = req.uid;
 
   try {
-    await db.collection('rooms').doc(roomId)
-      .collection('players').doc(playerId).update({
+    const roomRef = db.collection('rooms').doc(roomId);
+    const roomSnap = await roomRef.get();
+    if (!roomSnap.exists) {
+      return res.json({ success: false, error: 'ROOM_NOT_FOUND' });
+    }
+    const roomStatus = roomSnap.data()?.metadata?.status;
+    if (!isRoomStatusActive(roomStatus)) {
+      return res.json({
+        success: false,
+        error: roomStatus === 'TIMED_OUT' ? 'ROOM_TIMED_OUT' : 'ROOM_INACTIVE',
+      });
+    }
+
+    await Promise.all([
+      roomRef.collection('players').doc(playerId).update({
         lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
         status:     'connected',
-      });
+      }),
+      roomRef.update({
+        'metadata.lastActivityAt': admin.firestore.FieldValue.serverTimestamp(),
+      }),
+    ]);
     return res.json({ success: true });
-  } catch {
-    return res.json({ success: false });
+  } catch (err) {
+    return res.json({ success: false, error: err.message ?? 'HEARTBEAT_FAILED' });
   }
 });
 
@@ -605,6 +687,10 @@ setInterval(async () => {
   }
 }, 60_000);
 
+setInterval(async () => {
+  await expireIdleRooms();
+}, ROOM_MAINTENANCE_INTERVAL_MS);
+
 
 // ============================================================
 // ROOM WATCHER STARTUP
@@ -614,11 +700,37 @@ setInterval(async () => {
 async function restoreActiveRoomWatchers() {
   try {
     const snap = await db.collection('rooms')
-      .where('metadata.status', 'in', ['WAITING', 'IN_PROGRESS']).get();
+      .where('metadata.status', 'in', ACTIVE_ROOM_STATUS).get();
     console.log(`[startup] Restoring watchers for ${snap.size} active rooms`);
     snap.forEach(doc => watchRoom(doc.id));
   } catch (err) {
     console.error('[startup] Failed to restore room watchers:', err);
+  }
+}
+
+async function expireIdleRooms() {
+  try {
+    const now = Date.now();
+    const snap = await db.collection('rooms')
+      .where('metadata.status', 'in', ACTIVE_ROOM_STATUS).get();
+
+    for (const docSnap of snap.docs) {
+      const roomId = docSnap.id;
+      const metadata = docSnap.data()?.metadata ?? {};
+      const lastActivityAt = metadata.lastActivityAt?.toDate?.() ?? metadata.createdAt?.toDate?.();
+      if (!lastActivityAt) continue;
+      const idleMs = now - lastActivityAt.getTime();
+      if (idleMs < GAME_IDLE_TIMEOUT_MS) continue;
+
+      await docSnap.ref.update({
+        'metadata.status': 'TIMED_OUT',
+        'metadata.timedOutAt': admin.firestore.FieldValue.serverTimestamp(),
+      });
+      detachRoomWatcher(roomId);
+      console.log(`[maintenance] Timed out idle room ${roomId} after ${idleMs}ms`);
+    }
+  } catch (err) {
+    console.error('[maintenance] Failed to expire idle rooms:', err);
   }
 }
 
@@ -656,7 +768,7 @@ async function generateUniqueRoomCode() {
 
     const existing = await db.collection('rooms')
       .where('metadata.roomCode', '==', code)
-      .where('metadata.status', 'in', ['WAITING', 'IN_PROGRESS'])
+      .where('metadata.status', 'in', ACTIVE_ROOM_STATUS)
       .limit(1).get();
 
     if (existing.empty) return code;
